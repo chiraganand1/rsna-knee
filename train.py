@@ -48,7 +48,9 @@ class CFG:
 
     # Training
     EPOCHS = 10
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4
+    GRAD_ACCUM_STEPS = 4  # effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS
+    ENCODER_CHUNK_SIZE = 16  # max slices sent through the encoder at once (caps activation memory)
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
     FOLDS = 5
@@ -185,6 +187,8 @@ class RSNAModel(nn.Module):
         self.encoder = timm.create_model(
             CFG.MODEL_NAME, pretrained=True, num_classes=0, global_pool="avg"
         )
+        if hasattr(self.encoder, "set_grad_checkpointing"):
+            self.encoder.set_grad_checkpointing(True)
         feat_dim = self.encoder.num_features
         self.head = nn.Sequential(
             nn.Linear(feat_dim, 256),
@@ -195,7 +199,12 @@ class RSNAModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C, H, W = x.shape
-        feats = self.encoder(x.view(B * N, C, H, W))  # (B*N, feat_dim)
+        flat = x.view(B * N, C, H, W)
+        # Encode slices in chunks to cap peak activation memory instead of B*N at once.
+        feats = torch.cat(
+            [self.encoder(chunk) for chunk in flat.split(CFG.ENCODER_CHUNK_SIZE, dim=0)],
+            dim=0,
+        )
         feats = feats.view(B, N, -1).mean(dim=1)       # mean over slices → (B, feat_dim)
         return self.head(feats)                         # (B, num_classes)
 
@@ -216,15 +225,17 @@ def macro_auc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
     model.train()
     total_loss = 0.0
-    for images, labels in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for step, (images, labels) in enumerate(loader):
         images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
         with torch.amp.autocast("cuda"):
-            loss = criterion(model(images), labels)
+            loss = criterion(model(images), labels) / CFG.GRAD_ACCUM_STEPS
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        total_loss += loss.item()
+        if (step + 1) % CFG.GRAD_ACCUM_STEPS == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        total_loss += loss.item() * CFG.GRAD_ACCUM_STEPS
     return total_loss / len(loader)
 
 
@@ -293,7 +304,7 @@ def main():
         )
         val_loader = DataLoader(
             RSNADataset(val_fold, series_df, "train", get_transforms(False)),
-            batch_size=CFG.BATCH_SIZE * 2, shuffle=False,
+            batch_size=CFG.BATCH_SIZE, shuffle=False,
             num_workers=CFG.NUM_WORKERS, pin_memory=True,
         )
 
